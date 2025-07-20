@@ -1,0 +1,31 @@
+# VESC Differential Drive Robot Parameters (C++ Version)
+# 
+# This configuration file contains all the parameters needed for the
+# diff_vesc_can_ros2_pkg_cpp odometry system.
+
+vesc_odometry_node:
+  ros__parameters:
+    # Robot Physical Parameters
+    wheel_diameter: 0.3556          # Wheel diameter in meters (355.6mm)
+    wheel_separation: 0.370         # Distance between wheel centers in meters (370mm)
+    tachometer_pulses_per_rev: 23   # Mechanical pulses per wheel revolution
+    
+    # CAN interface settings
+    can_interface: 'can0'           # CAN interface name (can0, can1, etc.)
+    can_bitrate: 500000             # CAN bus bitrate (Hz)
+    
+    # VESC Controller IDs
+    left_vesc_id: 28                # Left wheel VESC controller ID
+    right_vesc_id: 46               # Right wheel VESC controller ID
+    
+    # Publishing settings
+    publish_rate: 50.0              # Odometry publish rate in Hz
+    
+    # Frame IDs
+    odom_frame_id: 'odom'           # Odometry frame ID
+    base_frame_id: 'base_link'      # Robot base frame ID
+    
+    # Covariance values (simplified - tune based on your system)
+    position_covariance: 0.1        # Position covariance diagonal
+    orientation_covariance: 0.1     # Orientation covariance diagonal
+    velocity_covariance: 0.1        # Velocity covariance diagonal
