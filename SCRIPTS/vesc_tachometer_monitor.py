@@ -2,7 +2,10 @@
 """
 Real-time VESC Tachometer Monitor
 
-This script reads CAN messages from a USB-CAN interface in real-time
+This script reads CAN messages from a USB-CAN         print("Interface: {self.interface} | Channel: {self.channel}")
+        print("Elec = Electrical revolutions (RAW sensor data)")
+        print("Mech = Mechanical revolutions (÷6 for reference only)")
+        print("Press Ctrl+C to stop")rface in real-time
 and displays tachometer values for VESC controllers 28 and 46.
 
 Requirements:
@@ -27,7 +30,8 @@ from dataclasses import dataclass
 class VESCTachometer:
     """Stores tachometer data for a VESC controller"""
     vesc_id: int
-    tachometer: int
+    tachometer_raw: int      # Electrical revolutions (no divisor)
+    tachometer: int          # Mechanical revolutions (divided by 6)
     voltage: float
     last_update: float
 
@@ -76,19 +80,23 @@ class VESCTachometerMonitor:
         
         vesc_id = self.tachometer_ids[msg.arbitration_id]
         
-        # Parse according to VESC protocol
-        # B0-B3: Tachometer (int32, scale 6 for electrical revolutions)
-        # B4-B5: Voltage In (int16, scale 10)
-        tachometer_raw = struct.unpack('>i', msg.data[0:4])[0]
+        # Parse according to VESC protocol documentation
+        # B0-B1: RPM (16-bit)
+        # B2-B3: Tachometer (16-bit, electrical revolutions) 
+        # B4-B5: Voltage In (16-bit, scale 10)
+        tachometer_raw = struct.unpack('>h', msg.data[2:4])[0]  # Fixed: bytes 2-3, not 0-3
         voltage_raw = struct.unpack('>h', msg.data[4:6])[0]
         
-        # Convert to mechanical revolutions (divide by 6 for electrical to mechanical)
-        tachometer = tachometer_raw // 6
+        # Keep raw electrical revolutions for precision and consistency with C++ code
+        # Mechanical conversion (÷6) should only happen at final distance/velocity calculations
+        tachometer_electrical = tachometer_raw  # Raw electrical revolutions
+        tachometer_mechanical = tachometer_raw // 6  # Mechanical revolutions (for reference)
         voltage = voltage_raw / 10.0
         
         return VESCTachometer(
             vesc_id=vesc_id,
-            tachometer=tachometer,
+            tachometer_raw=tachometer_electrical,    # Store electrical (consistent with C++)
+            tachometer=tachometer_mechanical,        # Store mechanical (for display comparison)
             voltage=voltage,
             last_update=time.time()
         )
@@ -102,6 +110,8 @@ class VESCTachometerMonitor:
         print("  VESC Real-time Tachometer Monitor")
         print("=" * 60)
         print(f"Interface: {self.interface} | Channel: {self.channel}")
+        print("Raw = Electrical revolutions (no divisor)")
+        print("Mech = Mechanical revolutions (÷6 for 6-pole motors)")
         print("Press Ctrl+C to stop")
         print("-" * 60)
         
@@ -114,7 +124,8 @@ class VESCTachometerMonitor:
                 age = current_time - data.last_update
                 status = "LIVE" if age < 1.0 else f"OLD ({age:.1f}s)"
                 
-                print(f"VESC {vesc_id:2d}: Tachometer: {data.tachometer:8d} | "
+                print(f"VESC {vesc_id:2d}: Elec: {data.tachometer_raw:8d} | "
+                      f"Mech: {data.tachometer:8d} | "
                       f"Voltage: {data.voltage:5.1f}V | Status: {status}")
             else:
                 print(f"VESC {vesc_id:2d}: No data received")
@@ -130,9 +141,13 @@ class VESCTachometerMonitor:
                     if hasattr(data, 'prev_tachometer') and hasattr(data, 'prev_time'):
                         dt = data.last_update - data.prev_time
                         if dt > 0:
-                            tacho_diff = data.tachometer - data.prev_tachometer
-                            rpm = (tacho_diff / dt) * 60.0  # Convert to RPM
-                            print(f"  VESC {vesc_id}: {rpm:6.1f} RPM")
+                            # Calculate RPM from both raw and mechanical values
+                            tacho_diff_raw = data.tachometer_raw - data.prev_tachometer_raw
+                            tacho_diff_mech = data.tachometer - data.prev_tachometer
+                            rpm_electrical = (tacho_diff_raw / dt) * 60.0
+                            rpm_mechanical = (tacho_diff_mech / dt) * 60.0
+                            print(f"  VESC {vesc_id}: Elec: {rpm_electrical:6.1f} RPM | "
+                                  f"Mech: {rpm_mechanical:6.1f} RPM")
         
         print(f"\nLast update: {time.strftime('%H:%M:%S', time.localtime())}")
     
@@ -154,6 +169,7 @@ class VESCTachometerMonitor:
                         # Store previous values for RPM calculation
                         if tach_data.vesc_id in self.vesc_data:
                             prev_data = self.vesc_data[tach_data.vesc_id]
+                            tach_data.prev_tachometer_raw = prev_data.tachometer_raw
                             tach_data.prev_tachometer = prev_data.tachometer
                             tach_data.prev_time = prev_data.last_update
                         
@@ -175,8 +191,8 @@ class VESCTachometerMonitor:
     def run_simple_output(self):
         """Run simple output mode - just print tachometer values as they arrive"""
         print("Simple tachometer output mode")
-        print("Format: TIMESTAMP VESC_ID TACHOMETER VOLTAGE")
-        print("-" * 50)
+        print("Format: TIMESTAMP VESC_ID ELECTRICAL_TACH MECHANICAL_TACH VOLTAGE")
+        print("-" * 70)
         
         try:
             while True:
@@ -188,7 +204,9 @@ class VESCTachometerMonitor:
                     if tach_data is not None:
                         timestamp = time.strftime('%H:%M:%S.%f', time.localtime())[:-3]
                         print(f"{timestamp} VESC_{tach_data.vesc_id:02d} "
-                              f"{tach_data.tachometer:8d} {tach_data.voltage:5.1f}V")
+                              f"Elec:{tach_data.tachometer_raw:8d} "
+                              f"Mech:{tach_data.tachometer:8d} "
+                              f"{tach_data.voltage:5.1f}V")
                         
         except KeyboardInterrupt:
             print("\nOutput stopped by user")

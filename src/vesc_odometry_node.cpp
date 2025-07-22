@@ -2,14 +2,69 @@
  * @file vesc_odometry_node.cpp
  * @brief VESC Odometry Node for ROS2 (C++ Implementation)
  * 
- * Calculates robot odometry from VESC CAN tachometer data for differential drive robot
+ * 🤖 ROBOT ODOMETRY SYSTEM
+ * This node calculates pr        RCLCPP_INFO(this->get_logger(), "🤖 ═══════════════════════════════════════════════════════");
+
+        // ═══════════════════════════════════════════════════════════════════
+        // 🔄 TACHOMETER STATE INITIALIZATION
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Initialize tachometer tracking variables
+        // std::nullopt indicates that we haven't received the first reading yet
+        left_tach_initial_ = std::nullopt;   // Initial left wheel tachometer reading (baseline)
+        right_tach_initial_ = std::nullopt;  // Initial right wheel tachometer reading (baseline)
+        
+        // Current tachometer values (updated in real-time from CAN messages)
+        left_tach_current_ = 0;
+        right_tach_current_ = 0;
+        
+        // Previous tachometer values (used for velocity calculations)
+        left_tach_previous_ = 0;
+        right_tach_previous_ = 0;
+
+        // ═══════════════════════════════════════════════════════════════════
+        // 🤖 ROBOT POSE AND ODOMETRY STATE INITIALIZATION
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Initialize robot pose in world coordinates
+        x_ = 0.0;                    // Robot X position (meters, forward/backward)
+        y_ = 0.0;                    // Robot Y position (meters, left/right)
+        theta_ = 0.0;                // Robot orientation (radians, counterclockwise from X-axis)
+        
+        // Initialize wheel distance accumulators
+        left_wheel_distance_ = 0.0;  // Total distance traveled by left wheel (meters)
+        right_wheel_distance_ = 0.0; // Total distance traveled by right wheel (meters)
+        
+        // Initialize robot velocity state
+        linear_velocity_ = 0.0;      // Robot linear velocity (m/s, forward/backward)
+        angular_velocity_ = 0.0;     // Robot angular velocity (rad/s, counterclockwise)
+        
+        // Initialize timing
+        last_time_ = this->get_clock()->now();n and velocity by monitoring VESC motor controller
+ * tachometer data via CAN bus. It implements differential drive kinematics to determine robot
+ * pose (x, y, θ) and publishes odometry information for navigation systems.
  * 
- * Robot Configuration:
- * - Wheel diameter: 355.6mm
- * - Wheel separation: 370mm (distance between wheel centers)
- * - Tachometer pulses per wheel revolution: 23
- * - VESC 28 (Left wheel): CAN ID 0x1B1C
- * - VESC 46 (Right wheel): CAN ID 0x1B2E
+ * 🔧 SYSTEM ARCHITECTURE:
+ * ┌─────────────┐    CAN Bus    ┌──────────────┐    ROS2 Topics    ┌─────────────┐
+ * │ VESC Motors │ ═══════════> │ Odometry Node│ ═══════════════> │ Navigation  │
+ * │ (Tachometer)│              │ (This File)  │                  │ Stack       │
+ * └─────────────┘              └──────────────┘                  └─────────────┘
+ * 
+ * 🛠️ HARDWARE CONFIGURATION:
+ * - Robot Type: Differential drive (two independent wheels)
+ * - Wheel diameter: 355.6mm (measured wheel circumference ÷ π)
+ * - Wheel separation: 370mm (distance between left and right wheel centers)
+ * - Motor Type: 23-pole direct drive motors with 3 Hall sensors
+ * - Tachometer Resolution: 138 ticks per mechanical wheel revolution (measured)
+ * - Left Motor: VESC ID 28 → CAN STATUS_5 ID 0x1B1C
+ * - Right Motor: VESC ID 46 → CAN STATUS_5 ID 0x1B2E
+ * 
+ * 📊 DATA FLOW:
+ * 1. VESC controllers send STATUS_5 messages via CAN (50Hz typical)
+ * 2. Node extracts tachometer values from CAN frames
+ * 3. Converts tachometer ticks to wheel distances
+ * 4. Applies differential drive kinematics for robot pose
+ * 5. Publishes odometry, TF transforms, and wheel distances
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -32,71 +87,163 @@
 #include <atomic>
 #include <cmath>
 
+/**
+ * @class VESCOdometryNode
+ * @brief Main odometry calculation node for VESC-based differential drive robot
+ * 
+ * This class implements a complete odometry system that:
+ * 🔄 Receives tachometer data from VESC motor controllers via CAN bus
+ * 📐 Converts tachometer ticks to wheel distances using calibrated parameters
+ * 🤖 Applies differential drive kinematics to calculate robot pose
+ * 📡 Publishes odometry messages and TF transforms for ROS2 navigation
+ * 
+ * Key Features:
+ * - Real-time CAN message processing with dedicated thread
+ * - Direct velocity calculation from distance changes
+ * - Thread-safe data handling with mutex protection
+ * - Comprehensive debug logging for system monitoring
+ */
 class VESCOdometryNode : public rclcpp::Node
 {
 public:
+    /**
+     * @brief Constructor - Initialize the VESC odometry node
+     * 
+     * This constructor performs complete system initialization:
+     * 1. 📋 Declares and retrieves ROS2 parameters
+     * 2. 🔧 Calculates derived parameters (wheel circumference, distance per tick)
+     * 3. 🚀 Initializes publishers, TF broadcaster, and timer
+     * 4. 🔌 Establishes CAN bus connection
+     * 5. 🧵 Starts background CAN message processing thread
+     */
     VESCOdometryNode() : Node("vesc_odometry_node")
     {
-        // Declare parameters
-        this->declare_parameter("wheel_diameter", 0.3556);
-        this->declare_parameter("wheel_separation", 0.370);
-        this->declare_parameter("tachometer_pulses_per_rev", 23);
-        this->declare_parameter("can_interface", "can0");
-        this->declare_parameter("publish_rate", 50.0);
-        this->declare_parameter("left_vesc_id", 28);
-        this->declare_parameter("right_vesc_id", 46);
+        // ═══════════════════════════════════════════════════════════════════
+        // 📋 PARAMETER DECLARATION AND RETRIEVAL
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Physical robot parameters
+        this->declare_parameter("wheel_diameter", 0.3556);        // Measured wheel diameter (m)
+        this->declare_parameter("wheel_separation", 0.370);       // Distance between wheel centers (m)
+        this->declare_parameter("tachometer_pulses_per_rev", 23); // Legacy parameter (poles per revolution)
+        this->declare_parameter("ticks_per_mechanical_revolution", 138.0); // Real-world calibrated value
+        
+        // CAN bus configuration
+        this->declare_parameter("can_interface", "can0");         // Linux CAN interface name
+        
+        // System timing
+        this->declare_parameter("publish_rate", 10.0);            // Odometry publishing frequency (Hz)
+        
+        // VESC motor controller IDs
+        this->declare_parameter("left_vesc_id", 28);              // Left wheel VESC identifier
+        this->declare_parameter("right_vesc_id", 46);             // Right wheel VESC identifier
 
-        // Get parameters
+        // Retrieve all parameters from ROS2 parameter server
         wheel_diameter_ = this->get_parameter("wheel_diameter").as_double();
         wheel_separation_ = this->get_parameter("wheel_separation").as_double();
         pulses_per_rev_ = this->get_parameter("tachometer_pulses_per_rev").as_int();
+        ticks_per_mechanical_revolution_ = this->get_parameter("ticks_per_mechanical_revolution").as_double();
         can_interface_ = this->get_parameter("can_interface").as_string();
         publish_rate_ = this->get_parameter("publish_rate").as_double();
         left_vesc_id_ = this->get_parameter("left_vesc_id").as_int();
         right_vesc_id_ = this->get_parameter("right_vesc_id").as_int();
 
-        // Calculate CAN message IDs for STATUS_5 messages
-        // CAN ID = 0x1B00 + VESC_ID
+        // ═══════════════════════════════════════════════════════════════════
+        // 🔧 CALCULATED PARAMETERS AND CAN ID GENERATION
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Calculate CAN message IDs for VESC STATUS_5 messages
+        // VESC Protocol: STATUS_5 CAN ID = 0x1B00 + VESC_ID
+        // Example: VESC ID 28 → CAN ID 0x1B00 + 28 = 0x1B1C
         vesc_left_status5_id_ = 0x1B00 + left_vesc_id_;
         vesc_right_status5_id_ = 0x1B00 + right_vesc_id_;
 
-        // Calculate wheel circumference and distance per pulse
-        wheel_circumference_ = M_PI * wheel_diameter_;
-        distance_per_pulse_ = wheel_circumference_ / pulses_per_rev_;
+        // Calculate fundamental wheel parameters
+        wheel_circumference_ = M_PI * wheel_diameter_;  // Circumference = π × diameter
+        
+        // 🎯 CRITICAL CALIBRATION PARAMETER
+        // This is the most important parameter for accurate odometry!
+        // Real-world measurement: 1379 ticks per 10 wheel turns = 137.9 ≈ 138 ticks/turn
+        // Motor analysis: 23-pole motor × 3 Hall sensors = 6 electrical states per pole
+        // Verification: 138 ÷ 23 = 6 (confirms 23-pole motor configuration)
+        distance_per_pulse_raw_ = wheel_circumference_ / ticks_per_mechanical_revolution_;
 
-        // Log robot configuration
-        RCLCPP_INFO(this->get_logger(), "Robot Configuration:");
-        RCLCPP_INFO(this->get_logger(), "  Left VESC ID: %d (CAN ID: 0x%X)", left_vesc_id_, vesc_left_status5_id_);
-        RCLCPP_INFO(this->get_logger(), "  Right VESC ID: %d (CAN ID: 0x%X)", right_vesc_id_, vesc_right_status5_id_);
-        RCLCPP_INFO(this->get_logger(), "  Wheel diameter: %.3fm", wheel_diameter_);
-        RCLCPP_INFO(this->get_logger(), "  Wheel separation: %.3fm", wheel_separation_);
-        RCLCPP_INFO(this->get_logger(), "  Wheel circumference: %.3fm", wheel_circumference_);
-        RCLCPP_INFO(this->get_logger(), "  Tachometer pulses per revolution: %d", pulses_per_rev_);
-        RCLCPP_INFO(this->get_logger(), "  Distance per pulse: %.6fm", distance_per_pulse_);
+        // ═══════════════════════════════════════════════════════════════════
+        // 📊 SYSTEM CONFIGURATION LOGGING
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Log complete robot configuration for verification and debugging
+        RCLCPP_INFO(this->get_logger(), "🤖 ═══════════════════════════════════════════════════════");
+        RCLCPP_INFO(this->get_logger(), "🤖 VESC ODOMETRY NODE - SYSTEM CONFIGURATION");
+        RCLCPP_INFO(this->get_logger(), "🤖 ═══════════════════════════════════════════════════════");
+        RCLCPP_INFO(this->get_logger(), "🔧 MOTOR CONTROLLERS:");
+        RCLCPP_INFO(this->get_logger(), "   • Left VESC ID: %d → CAN STATUS_5 ID: 0x%X", left_vesc_id_, vesc_left_status5_id_);
+        RCLCPP_INFO(this->get_logger(), "   • Right VESC ID: %d → CAN STATUS_5 ID: 0x%X", right_vesc_id_, vesc_right_status5_id_);
+        RCLCPP_INFO(this->get_logger(), "🛞 WHEEL PARAMETERS:");
+        RCLCPP_INFO(this->get_logger(), "   • Wheel diameter: %.3f m", wheel_diameter_);
+        RCLCPP_INFO(this->get_logger(), "   • Wheel separation: %.3f m", wheel_separation_);
+        RCLCPP_INFO(this->get_logger(), "   • Wheel circumference: %.3f m", wheel_circumference_);
+        RCLCPP_INFO(this->get_logger(), "📐 TACHOMETER CALIBRATION:");
+        RCLCPP_INFO(this->get_logger(), "   • Ticks per mechanical revolution: %.1f (real-world measured)", ticks_per_mechanical_revolution_);
+        RCLCPP_INFO(this->get_logger(), "   • Distance per tachometer tick: %.6f m", distance_per_pulse_raw_);
+        RCLCPP_INFO(this->get_logger(), "🔌 CAN INTERFACE: %s", can_interface_.c_str());
+        RCLCPP_INFO(this->get_logger(), "⏱️  PUBLISH RATE: %.1f Hz", publish_rate_);
+        RCLCPP_INFO(this->get_logger(), "🤖 ═══════════════════════════════════════════════════════");
 
-        // Initialize tachometer tracking
-        left_tach_initial_ = std::nullopt;
-        right_tach_initial_ = std::nullopt;
+        // ═══════════════════════════════════════════════════════════════════
+        // 🔄 TACHOMETER STATE INITIALIZATION
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Initialize tachometer tracking variables
+        // std::nullopt indicates that we haven't received the first reading yet
+        left_tach_initial_ = std::nullopt;   // Initial left wheel tachometer reading (baseline)
+        right_tach_initial_ = std::nullopt;  // Initial right wheel tachometer reading (baseline)
+        
+        // Current tachometer values (updated in real-time from CAN messages)
         left_tach_current_ = 0;
         right_tach_current_ = 0;
+        
+        // Previous tachometer values (used for velocity calculations)
         left_tach_previous_ = 0;
         right_tach_previous_ = 0;
 
-        // Initialize odometry state
-        x_ = 0.0;
-        y_ = 0.0;
-        theta_ = 0.0;
-        left_wheel_distance_ = 0.0;
-        right_wheel_distance_ = 0.0;
-        linear_velocity_ = 0.0;
-        angular_velocity_ = 0.0;
+        // ═══════════════════════════════════════════════════════════════════
+        // 🤖 ROBOT POSE AND ODOMETRY STATE INITIALIZATION
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Initialize robot pose in world coordinates
+        x_ = 0.0;                    // Robot X position (meters, forward/backward)
+        y_ = 0.0;                    // Robot Y position (meters, left/right)
+        theta_ = 0.0;                // Robot orientation (radians, counterclockwise from X-axis)
+        
+        // Initialize wheel distance accumulators
+        left_wheel_distance_ = 0.0;  // Total distance traveled by left wheel (meters)
+        right_wheel_distance_ = 0.0; // Total distance traveled by right wheel (meters)
+        
+        // Initialize robot velocity state
+        linear_velocity_ = 0.0;      // Robot linear velocity (m/s, forward/backward)
+        angular_velocity_ = 0.0;     // Robot angular velocity (rad/s, counterclockwise)
+        
+        // Initialize timing
         last_time_ = this->get_clock()->now();
 
-        // Create publishers
+        // ═══════════════════════════════════════════════════════════════════
+        //  ROS2 PUBLISHERS AND COMMUNICATION SETUP
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Create ROS2 publishers for different data streams
+        // Queue size of 10 provides buffer for message delivery
         odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>("odom_real", 10);
+        RCLCPP_INFO(this->get_logger(), "📡 Created publisher: /odom_real (nav_msgs/Odometry)");
+        
         left_distance_publisher_ = this->create_publisher<std_msgs::msg::Float64>("left_wheel_distance", 10);
+        RCLCPP_INFO(this->get_logger(), "📡 Created publisher: /left_wheel_distance (std_msgs/Float64)");
+        
         right_distance_publisher_ = this->create_publisher<std_msgs::msg::Float64>("right_wheel_distance", 10);
+        RCLCPP_INFO(this->get_logger(), "📡 Created publisher: /right_wheel_distance (std_msgs/Float64)");
+        
         cmd_vel_publisher_ = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel_real", 10);
+        RCLCPP_INFO(this->get_logger(), "📡 Created publisher: /cmd_vel_real (geometry_msgs/Twist)");
 
         // Create TF broadcaster
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -140,6 +287,7 @@ private:
     double wheel_diameter_;
     double wheel_separation_;
     int pulses_per_rev_;
+    double ticks_per_mechanical_revolution_;
     std::string can_interface_;
     double publish_rate_;
     int left_vesc_id_;
@@ -151,7 +299,7 @@ private:
 
     // Calculated values
     double wheel_circumference_;
-    double distance_per_pulse_;
+    double distance_per_pulse_raw_;  // Distance per tachometer tick (mechanical revolutions)
 
     // Tachometer tracking
     std::optional<int32_t> left_tach_initial_;
@@ -189,216 +337,394 @@ private:
     std::thread can_thread_;
     std::atomic<bool> running_;
 
+    // ********************************************************************************
+    // *                             CAN INTERFACE METHODS                           *
+    // ********************************************************************************
+    
+    /**
+     * @brief Initialize the CAN socket connection
+     * @return true if successful, false otherwise
+     * 
+     * This method sets up the Linux SocketCAN interface to communicate with VESC controllers.
+     * It creates a raw CAN socket and binds it to the specified CAN interface (usually "can0").
+     */
     bool initializeCAN()
     {
-        // Create socket
+        // Step 1: Create a raw CAN socket
+        // PF_CAN = Protocol Family for CAN bus
+        // SOCK_RAW = Raw socket type for direct CAN frame access
+        // CAN_RAW = CAN protocol for raw frames
         can_socket_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
         if (can_socket_ < 0) {
-            RCLCPP_ERROR(this->get_logger(), "Error creating CAN socket");
+            RCLCPP_ERROR(this->get_logger(), "❌ Error creating CAN socket");
             return false;
         }
 
-        // Get interface index
+        // Step 2: Get the network interface index for the CAN interface
+        // We need the interface index (not name) to bind the socket
         struct ifreq ifr;
-        strcpy(ifr.ifr_name, can_interface_.c_str());
+        strcpy(ifr.ifr_name, can_interface_.c_str());  // Copy interface name (e.g., "can0")
+        
         if (ioctl(can_socket_, SIOCGIFINDEX, &ifr) < 0) {
-            RCLCPP_ERROR(this->get_logger(), "Error getting interface index for %s", can_interface_.c_str());
+            RCLCPP_ERROR(this->get_logger(), "❌ Error getting interface index for %s", can_interface_.c_str());
             close(can_socket_);
             return false;
         }
 
-        // Bind socket to CAN interface
+        // Step 3: Bind the socket to the CAN interface
+        // This connects our socket to the physical CAN bus
         struct sockaddr_can addr;
-        addr.can_family = AF_CAN;
-        addr.can_ifindex = ifr.ifr_ifindex;
+        addr.can_family = AF_CAN;                    // Address family for CAN
+        addr.can_ifindex = ifr.ifr_ifindex;          // Interface index from step 2
 
         if (bind(can_socket_, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            RCLCPP_ERROR(this->get_logger(), "Error binding CAN socket");
+            RCLCPP_ERROR(this->get_logger(), "❌ Error binding CAN socket to interface %s", can_interface_.c_str());
             close(can_socket_);
             return false;
         }
 
+        RCLCPP_INFO(this->get_logger(), "✅ CAN socket successfully bound to interface %s", can_interface_.c_str());
         return true;
     }
 
+    /**
+     * @brief Main loop for receiving and processing CAN messages
+     * 
+     * This method runs in a separate thread and continuously listens for CAN messages.
+     * It uses select() with a timeout to avoid blocking indefinitely.
+     * When a message is received, it calls processCANMessage() to handle it.
+     */
     void canMessageLoop()
     {
-        RCLCPP_INFO(this->get_logger(), "CAN message loop started...");
+        RCLCPP_INFO(this->get_logger(), "🚀 CAN message reception loop started...");
         
-        struct can_frame frame;
+        struct can_frame frame;  // Structure to hold received CAN frame
         
         while (running_) {
+            // Step 1: Set up file descriptor set for select()
+            // This allows us to wait for data with a timeout
             fd_set readSet;
-            FD_ZERO(&readSet);
-            FD_SET(can_socket_, &readSet);
+            FD_ZERO(&readSet);                    // Clear the set
+            FD_SET(can_socket_, &readSet);        // Add our CAN socket to the set
             
+            // Step 2: Set timeout for select() call
+            // This prevents the thread from blocking forever if no messages arrive
             struct timeval timeout;
-            timeout.tv_sec = 1;
-            timeout.tv_usec = 0;
+            timeout.tv_sec = 1;      // 1 second timeout
+            timeout.tv_usec = 0;     // 0 microseconds
             
+            // Step 3: Wait for data to be available on the socket
+            // select() returns:
+            //   > 0: Number of file descriptors ready for reading
+            //   = 0: Timeout occurred
+            //   < 0: Error occurred
             int result = select(can_socket_ + 1, &readSet, nullptr, nullptr, &timeout);
             
             if (result > 0 && FD_ISSET(can_socket_, &readSet)) {
+                // Step 4: Data is available - read the CAN frame
                 ssize_t nbytes = read(can_socket_, &frame, sizeof(struct can_frame));
                 
                 if (nbytes == sizeof(struct can_frame)) {
-                    // Debug: Log every received CAN message
-                    uint32_t actual_id = frame.can_id & CAN_EFF_MASK;  // Remove flags
+                    // Step 5: Successfully received a complete CAN frame
+                    // Extract the actual CAN ID (remove extended frame and other flags)
+                    uint32_t actual_id = frame.can_id & CAN_EFF_MASK;
+                    
+                    // Debug: Log received messages (throttled to avoid spam)
                     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
-                                         "Received CAN message: ID=0x%X (raw=0x%X)", actual_id, frame.can_id);
+                                         "📨 CAN ID: 0x%X (raw: 0x%X)", actual_id, frame.can_id);
+                    
+                    // Step 6: Process the received message
                     processCANMessage(frame);
                 }
             } else if (result < 0 && running_) {
-                RCLCPP_WARN(this->get_logger(), "CAN receive error");
+                // Error occurred during select()
+                RCLCPP_WARN(this->get_logger(), "⚠️ CAN receive error during select()");
             }
+            // If result == 0, it's just a timeout - continue the loop
         }
+        
+        RCLCPP_INFO(this->get_logger(), "🛑 CAN message loop stopped");
     }
 
+    /**
+     * @brief Process a received CAN message and extract tachometer data
+     * @param frame The received CAN frame
+     * 
+     * This method filters CAN messages to find VESC STATUS_5 messages containing tachometer data.
+     * VESC STATUS_5 messages have CAN ID = 0x1B00 + VESC_ID and contain tachometer in bytes 2-3.
+     * 
+     * CAN Frame Structure for VESC STATUS_5:
+     * - Byte 0-1: Other VESC data
+     * - Byte 2-3: Tachometer (16-bit signed value)
+     * - Byte 4-7: Other VESC data
+     */
     void processCANMessage(const struct can_frame& frame)
     {
-        // Extract actual CAN ID (remove extended frame and other flags)
+        // Step 1: Extract the actual CAN ID (remove extended frame and error flags)
         uint32_t actual_id = frame.can_id & CAN_EFF_MASK;
         
-        // Check if this is a VESC STATUS_5 message from our VESCs
-        if (actual_id != vesc_left_status5_id_ && actual_id != vesc_right_status5_id_) {
+        // Step 2: Check if this message is from one of our VESCs
+        // We only care about STATUS_5 messages from our left and right wheel VESCs
+        bool is_left_vesc = (actual_id == vesc_left_status5_id_);
+        bool is_right_vesc = (actual_id == vesc_right_status5_id_);
+        
+        if (!is_left_vesc && !is_right_vesc) {
+            // This message is not from our VESCs - ignore it
             return;
         }
         
+        // Step 3: Validate frame size
+        // STATUS_5 messages should have at least 6 bytes (we need bytes 2-3 for tachometer)
         if (frame.can_dlc < 6) {
+            RCLCPP_WARN(this->get_logger(), "⚠️ CAN frame too short: %d bytes (expected ≥6)", frame.can_dlc);
             return;
         }
 
         try {
-            // Parse tachometer from bytes 2-3 (16-bit signed value)
-            // Based on CAN dump: bytes 2-3 contain the tachometer data
+            // Step 4: Extract tachometer data from bytes 2-3
+            // Combine two bytes into a 16-bit value (big-endian format)
             int32_t tachometer_raw = (frame.data[2] << 8) | frame.data[3];
             
-            // Convert to signed 16-bit value
+            // Step 5: Convert from unsigned 16-bit to signed 16-bit
+            // If the value is > 32767, it represents a negative number in two's complement
             if (tachometer_raw > 32767) {
-                tachometer_raw -= 65536;
+                tachometer_raw -= 65536;  // Convert to negative value
             }
-            
-            // IMPORTANT: VESC reports electrical revolutions, divide by 6 for mechanical revolutions
-            // This is because VESC controllers use 6-pole motors (6 electrical revolutions = 1 mechanical revolution)
-            // Based on user measurements: 10 mechanical rotations in 12s should give ~0.93 m/s, not 2.3 m/s
-            int32_t tachometer = tachometer_raw / 6;
 
+            // Step 6: Use the tachometer value directly
+            // IMPORTANT: This tachometer reports mechanical revolutions directly
+            // Real-world measurement: 138 ticks per mechanical turn (23-pole motor with 3 Hall sensors)
+            // No electrical-to-mechanical conversion needed
+            int32_t tachometer = tachometer_raw;
+
+            // Step 7: Thread-safe update of tachometer values
             std::lock_guard<std::mutex> lock(data_mutex_);
             
-            if (actual_id == vesc_left_status5_id_) {
-                // Left wheel (VESC 28)
-                if (!left_tach_initial_.has_value()) {
-                    left_tach_initial_ = tachometer;
-                    left_tach_previous_ = tachometer;
-                    RCLCPP_INFO(this->get_logger(), "Left wheel tachometer initialized: %d", tachometer);
-                } else {
-                    // Debug: Show tachometer updates every 50 messages
-                    static int left_debug_count = 0;
-                    if (++left_debug_count % 50 == 0) {
-                        RCLCPP_INFO(this->get_logger(), "Left tach update: %d (diff from init: %d)", 
-                                   tachometer, tachometer - left_tach_initial_.value());
-                    }
-                }
-                left_tach_current_ = tachometer;
-                
-            } else if (actual_id == vesc_right_status5_id_) {
-                // Right wheel (VESC 46)
-                if (!right_tach_initial_.has_value()) {
-                    right_tach_initial_ = tachometer;
-                    right_tach_previous_ = tachometer;
-                    RCLCPP_INFO(this->get_logger(), "Right wheel tachometer initialized: %d", tachometer);
-                } else {
-                    // Debug: Show tachometer updates every 50 messages
-                    static int right_debug_count = 0;
-                    if (++right_debug_count % 50 == 0) {
-                        RCLCPP_INFO(this->get_logger(), "Right tach update: %d (diff from init: %d)", 
-                                   tachometer, tachometer - right_tach_initial_.value());
-                    }
-                }
-                right_tach_current_ = tachometer;
+            if (is_left_vesc) {
+                updateLeftWheelTachometer(tachometer);
+            } else if (is_right_vesc) {
+                updateRightWheelTachometer(tachometer);
             }
+            
         } catch (const std::exception& e) {
-            RCLCPP_WARN(this->get_logger(), "Error parsing CAN message: %s", e.what());
+            RCLCPP_WARN(this->get_logger(), "❌ Error parsing CAN message: %s", e.what());
         }
     }
 
+    // ********************************************************************************
+    // *                        TACHOMETER UPDATE METHODS                            *
+    // ********************************************************************************
+
+    /**
+     * @brief Update left wheel tachometer value and handle initialization
+     * @param tachometer New tachometer reading from left wheel VESC
+     */
+    void updateLeftWheelTachometer(int32_t tachometer)
+    {
+        if (!left_tach_initial_.has_value()) {
+            // First reading - initialize the baseline
+            left_tach_initial_ = tachometer;
+            left_tach_previous_ = tachometer;
+            RCLCPP_INFO(this->get_logger(), "🟢 Left wheel tachometer initialized: %d", tachometer);
+        } else {
+            // Check for unexpected large jumps (might indicate data corruption)
+            int32_t tach_jump = std::abs(tachometer - left_tach_current_);
+            if (tach_jump > 10) { // Threshold for detecting abnormal jumps
+                RCLCPP_WARN(this->get_logger(), "⚠️ LEFT WHEEL: Large tachometer jump %d→%d (Δ%d)", 
+                           left_tach_current_, tachometer, tach_jump);
+            }
+            
+            // Periodic debug output (every 50 messages to avoid spam)
+            static int left_debug_count = 0;
+            if (++left_debug_count % 50 == 0) {
+                int32_t total_diff = tachometer - left_tach_initial_.value();
+                int32_t delta = tachometer - left_tach_current_;
+                RCLCPP_INFO(this->get_logger(), "🔄 Left: %d (total: %+d, delta: %+d)", 
+                           tachometer, total_diff, delta);
+            }
+        }
+        left_tach_current_ = tachometer;
+    }
+
+    /**
+     * @brief Update right wheel tachometer value and handle initialization
+     * @param tachometer New tachometer reading from right wheel VESC
+     */
+    void updateRightWheelTachometer(int32_t tachometer)
+    {
+        if (!right_tach_initial_.has_value()) {
+            // First reading - initialize the baseline
+            right_tach_initial_ = tachometer;
+            right_tach_previous_ = tachometer;
+            RCLCPP_INFO(this->get_logger(), "🔵 Right wheel tachometer initialized: %d", tachometer);
+        } else {
+            // Check for unexpected large jumps (might indicate data corruption)
+            int32_t tach_jump = std::abs(tachometer - right_tach_current_);
+            if (tach_jump > 10) { // Threshold for detecting abnormal jumps
+                RCLCPP_WARN(this->get_logger(), "⚠️ RIGHT WHEEL: Large tachometer jump %d→%d (Δ%d)", 
+                           right_tach_current_, tachometer, tach_jump);
+            }
+            
+            // Periodic debug output (every 50 messages to avoid spam)
+            static int right_debug_count = 0;
+            if (++right_debug_count % 50 == 0) {
+                int32_t total_diff = tachometer - right_tach_initial_.value();
+                int32_t delta = tachometer - right_tach_current_;
+                RCLCPP_INFO(this->get_logger(), "🔄 Right: %d (total: %+d, delta: %+d)", 
+                           tachometer, total_diff, delta);
+            }
+        }
+        right_tach_current_ = tachometer;
+    }
+
+    // ********************************************************************************
+    // *                        ODOMETRY CALCULATION METHODS                         *
+    // ********************************************************************************
+
+    /**
+     * @brief Calculate wheel distances from tachometer readings
+     * @return pair<left_distance, right_distance> in meters
+     * 
+     * This method converts raw tachometer tick counts to actual wheel distances.
+     * It uses the calibrated distance_per_pulse_raw_ value for accurate conversion.
+     */
     std::pair<double, double> calculateWheelDistances()
     {
+        // Check if tachometers have been initialized
         if (!left_tach_initial_.has_value() || !right_tach_initial_.has_value()) {
-            return {0.0, 0.0};
+            return {0.0, 0.0};  // Return zero distances if not initialized
         }
 
-        // Calculate tachometer differences from initial position
+        // Calculate tachometer differences from initial position (baseline)
         int32_t left_tach_diff = left_tach_current_ - left_tach_initial_.value();
         int32_t right_tach_diff = right_tach_current_ - right_tach_initial_.value();
 
-        // Convert tachometer pulses to distance
-        double left_distance = left_tach_diff * distance_per_pulse_;
-        double right_distance = right_tach_diff * distance_per_pulse_;
+        // Convert tachometer ticks to actual distances using calibrated conversion
+        // Each tick represents distance_per_pulse_raw_ meters of wheel travel
+        double left_distance = left_tach_diff * distance_per_pulse_raw_;
+        double right_distance = right_tach_diff * distance_per_pulse_raw_;
 
         return {left_distance, right_distance};
     }
 
-    std::pair<double, double> calculateVelocities(double dt)
+    /**
+     * @brief Calculate wheel velocities from distance changes
+     * @param left_delta Change in left wheel distance since last update (meters)
+     * @param right_delta Change in right wheel distance since last update (meters)
+     * @param dt Time interval since last update (seconds)
+     * @return pair<left_velocity, right_velocity> in m/s
+     * 
+     * This method calculates instantaneous wheel velocities using simple physics:
+     * velocity = distance_change / time_interval
+     */
+    std::pair<double, double> calculateWheelVelocities(double left_delta, double right_delta, double dt)
     {
-        if (dt <= 0) {
+        // Avoid division by zero and ensure reasonable time intervals
+        if (dt <= 0.001) {  // Less than 1ms is unrealistic
             return {0.0, 0.0};
         }
 
-        // Calculate tachometer differences since last update
-        int32_t left_tach_delta = left_tach_current_ - left_tach_previous_;
-        int32_t right_tach_delta = right_tach_current_ - right_tach_previous_;
+        // Calculate velocities using basic physics: v = Δd / Δt
+        double left_velocity = left_delta / dt;   // Left wheel velocity (m/s)
+        double right_velocity = right_delta / dt; // Right wheel velocity (m/s)
 
-        // Convert to velocities
-        double left_velocity = (left_tach_delta * distance_per_pulse_) / dt;
-        double right_velocity = (right_tach_delta * distance_per_pulse_) / dt;
-
-        // Update previous values
-        left_tach_previous_ = left_tach_current_;
-        right_tach_previous_ = right_tach_current_;
+        // Debug: Show velocity calculation details periodically
+        static int velocity_debug_count = 0;
+        if (++velocity_debug_count % 25 == 0) {  // Every 25 calls (0.5s at 50Hz)
+            RCLCPP_INFO(this->get_logger(), 
+                       "⚡ VELOCITY: dt=%.3fs | Left: Δ%.4fm → %.3fm/s | Right: Δ%.4fm → %.3fm/s",
+                       dt, left_delta, left_velocity, right_delta, right_velocity);
+        }
 
         return {left_velocity, right_velocity};
     }
 
-    void updateOdometry(double left_distance, double right_distance, double dt)
+    // ********************************************************************************
+    // *                        ODOMETRY CALCULATION METHODS                         *
+    // ********************************************************************************
+
+    /**
+     * @brief Update robot odometry using differential drive kinematics
+     * @param left_distance Change in left wheel distance since last update (meters)
+     * @param right_distance Change in right wheel distance since last update (meters)
+     * @param dt Time interval since last update (seconds)
+     * @param current_time Current ROS2 timestamp
+     * 
+     * This method implements standard differential drive kinematics to calculate:
+     * - Robot position (x, y) in the world frame
+     * - Robot orientation (θ) relative to the initial heading
+     * - Robot linear and angular velocities
+     */
+    void updateOdometry(double left_distance, double right_distance, double dt, rclcpp::Time /*current_time*/)
     {
-        // Calculate distance traveled by robot center
+        // ═══════════════════════════════════════════════════════════════════
+        // 📐 DIFFERENTIAL DRIVE KINEMATICS CALCULATIONS
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Calculate distance traveled by robot center (average of both wheels)
         double distance_center = (left_distance + right_distance) / 2.0;
 
-        // Calculate change in orientation
+        // Calculate change in robot orientation using wheel distance difference
+        // Positive delta_theta means counterclockwise rotation (right wheel traveled more)
         double delta_theta = (right_distance - left_distance) / wheel_separation_;
 
-        // Update robot pose
+        // ═══════════════════════════════════════════════════════════════════
+        // 🤖 ROBOT POSE UPDATE (POSITION AND ORIENTATION)
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Calculate change in robot position using kinematics
         double delta_x, delta_y;
+        
         if (std::abs(delta_theta) < 1e-6) {
-            // Straight line motion
+            // STRAIGHT LINE MOTION: When delta_theta ≈ 0, robot moves in straight line
+            // Simple trigonometry: project distance_center in current heading direction
             delta_x = distance_center * std::cos(theta_);
             delta_y = distance_center * std::sin(theta_);
         } else {
-            // Arc motion
-            double radius = distance_center / delta_theta;
+            // ARC MOTION: When delta_theta ≠ 0, robot follows curved path
+            // Use arc geometry to calculate position change
+            double radius = distance_center / delta_theta;  // Instantaneous radius of curvature
             delta_x = radius * (std::sin(theta_ + delta_theta) - std::sin(theta_));
             delta_y = radius * (-std::cos(theta_ + delta_theta) + std::cos(theta_));
         }
 
-        x_ += delta_x;
-        y_ += delta_y;
-        theta_ += delta_theta;
+        // Update robot position in world coordinates
+        x_ += delta_x;      // Update X position (forward/backward)
+        y_ += delta_y;      // Update Y position (left/right)
+        theta_ += delta_theta; // Update orientation (rotation)
 
-        // Normalize theta to [-pi, pi]
+        // Normalize orientation angle to [-π, π] range
         while (theta_ > M_PI) {
-            theta_ -= 2.0 * M_PI;
+            theta_ -= 2.0 * M_PI;   // Remove full rotations (too positive)
         }
         while (theta_ < -M_PI) {
-            theta_ += 2.0 * M_PI;
+            theta_ += 2.0 * M_PI;   // Remove full rotations (too negative)
         }
 
-        // Calculate velocities
-        if (dt > 0) {
-            linear_velocity_ = distance_center / dt;
-            angular_velocity_ = delta_theta / dt;
+        // ═══════════════════════════════════════════════════════════════════
+        // ⚡ VELOCITY CALCULATIONS
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Calculate wheel velocities from distance changes and time interval
+        auto [left_wheel_vel, right_wheel_vel] = calculateWheelVelocities(left_distance, right_distance, dt);
+        
+        // Calculate robot center velocities from wheel velocities
+        linear_velocity_ = (left_wheel_vel + right_wheel_vel) / 2.0;        // Linear velocity (m/s)
+        angular_velocity_ = (right_wheel_vel - left_wheel_vel) / wheel_separation_; // Angular velocity (rad/s)
+        
+        // Debug: Show odometry update details periodically
+        static int odom_debug_count = 0;
+        if (++odom_debug_count % 50 == 0) {  // Every 50 calls (1s at 50Hz)
+            RCLCPP_INFO(this->get_logger(), 
+                       "🤖 POSE: x=%.3f y=%.3f θ=%.3f° | VEL: %.3fm/s %.1f°/s | ΔL=%.4f ΔR=%.4f dt=%.3fs",
+                       x_, y_, theta_ * 180.0 / M_PI, linear_velocity_, 
+                       angular_velocity_ * 180.0 / M_PI, left_distance, right_distance, dt);
         }
     }
+
+    // ********************************************************************************
+    // *                           PUBLISHING METHODS                                *
+    // ********************************************************************************
 
     void publishOdometry()
     {
@@ -444,8 +770,8 @@ private:
                        delta_left, delta_right, left_wheel_distance_, left_distance, right_wheel_distance_, right_distance);
         }
 
-        // Update odometry
-        updateOdometry(delta_left, delta_right, dt);
+        // Update odometry using differential drive kinematics
+        updateOdometry(delta_left, delta_right, dt, current_time);
 
         // Debug: Show velocities every 100 cycles
         static int velocity_debug_count = 0;
@@ -528,6 +854,16 @@ private:
     }
 };
 
+// ********************************************************************************
+// *                                  MAIN ENTRY POINT                           *
+// ********************************************************************************
+
+/**
+ * @brief Main function - Initialize and run the VESC odometry node
+ * @param argc Command line argument count
+ * @param argv Command line arguments
+ * @return Exit status
+ */
 int main(int argc, char * argv[])
 {
     rclcpp::init(argc, argv);
