@@ -93,10 +93,10 @@ public:
         last_time_ = this->get_clock()->now();
 
         // Create publishers
-        odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>("odom", 10);
+        odom_publisher_ = this->create_publisher<nav_msgs::msg::Odometry>("odom_real", 10);
         left_distance_publisher_ = this->create_publisher<std_msgs::msg::Float64>("left_wheel_distance", 10);
         right_distance_publisher_ = this->create_publisher<std_msgs::msg::Float64>("right_wheel_distance", 10);
-        cmd_vel_publisher_ = this->create_publisher<geometry_msgs::msg::Twist>("wheel_velocities", 10);
+        cmd_vel_publisher_ = this->create_publisher<geometry_msgs::msg::Twist>("cmd_vel_real", 10);
 
         // Create TF broadcaster
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -242,6 +242,10 @@ private:
                 ssize_t nbytes = read(can_socket_, &frame, sizeof(struct can_frame));
                 
                 if (nbytes == sizeof(struct can_frame)) {
+                    // Debug: Log every received CAN message
+                    uint32_t actual_id = frame.can_id & CAN_EFF_MASK;  // Remove flags
+                    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+                                         "Received CAN message: ID=0x%X (raw=0x%X)", actual_id, frame.can_id);
                     processCANMessage(frame);
                 }
             } else if (result < 0 && running_) {
@@ -252,36 +256,63 @@ private:
 
     void processCANMessage(const struct can_frame& frame)
     {
+        // Extract actual CAN ID (remove extended frame and other flags)
+        uint32_t actual_id = frame.can_id & CAN_EFF_MASK;
+        
+        // Check if this is a VESC STATUS_5 message from our VESCs
+        if (actual_id != vesc_left_status5_id_ && actual_id != vesc_right_status5_id_) {
+            return;
+        }
+        
         if (frame.can_dlc < 6) {
             return;
         }
 
         try {
-            // Parse STATUS_5 message: tachometer (bytes 0-3) + voltage (bytes 4-5)
-            int32_t tachometer_raw = (frame.data[0] << 24) | (frame.data[1] << 16) | 
-                                    (frame.data[2] << 8) | frame.data[3];
+            // Parse tachometer from bytes 2-3 (16-bit signed value)
+            // Based on CAN dump: bytes 2-3 contain the tachometer data
+            int32_t tachometer_raw = (frame.data[2] << 8) | frame.data[3];
             
-            // Convert electrical tachometer to mechanical tachometer
-            // VESC reports electrical revolutions (6 electrical = 1 mechanical)
+            // Convert to signed 16-bit value
+            if (tachometer_raw > 32767) {
+                tachometer_raw -= 65536;
+            }
+            
+            // IMPORTANT: VESC reports electrical revolutions, divide by 6 for mechanical revolutions
+            // This is because VESC controllers use 6-pole motors (6 electrical revolutions = 1 mechanical revolution)
             int32_t tachometer = tachometer_raw / 6;
 
             std::lock_guard<std::mutex> lock(data_mutex_);
             
-            if (frame.can_id == vesc_left_status5_id_) {
+            if (actual_id == vesc_left_status5_id_) {
                 // Left wheel (VESC 28)
                 if (!left_tach_initial_.has_value()) {
                     left_tach_initial_ = tachometer;
                     left_tach_previous_ = tachometer;
                     RCLCPP_INFO(this->get_logger(), "Left wheel tachometer initialized: %d", tachometer);
+                } else {
+                    // Debug: Show tachometer updates every 50 messages
+                    static int left_debug_count = 0;
+                    if (++left_debug_count % 50 == 0) {
+                        RCLCPP_INFO(this->get_logger(), "Left tach update: %d (diff from init: %d)", 
+                                   tachometer, tachometer - left_tach_initial_.value());
+                    }
                 }
                 left_tach_current_ = tachometer;
                 
-            } else if (frame.can_id == vesc_right_status5_id_) {
+            } else if (actual_id == vesc_right_status5_id_) {
                 // Right wheel (VESC 46)
                 if (!right_tach_initial_.has_value()) {
                     right_tach_initial_ = tachometer;
                     right_tach_previous_ = tachometer;
                     RCLCPP_INFO(this->get_logger(), "Right wheel tachometer initialized: %d", tachometer);
+                } else {
+                    // Debug: Show tachometer updates every 50 messages
+                    static int right_debug_count = 0;
+                    if (++right_debug_count % 50 == 0) {
+                        RCLCPP_INFO(this->get_logger(), "Right tach update: %d (diff from init: %d)", 
+                                   tachometer, tachometer - right_tach_initial_.value());
+                    }
                 }
                 right_tach_current_ = tachometer;
             }
@@ -378,8 +409,12 @@ private:
         // Calculate current wheel distances
         auto [left_distance, right_distance] = calculateWheelDistances();
 
-        // Calculate velocities
-        auto [left_vel, right_vel] = calculateVelocities(dt);
+        // Debug: Show wheel distances every 100 cycles
+        static int distance_debug_count = 0;
+        if (++distance_debug_count % 100 == 0) {
+            RCLCPP_INFO(this->get_logger(), "Wheel distances: left=%.3f, right=%.3f", 
+                       left_distance, right_distance);
+        }
 
         // Calculate change in distances since last update
         double delta_left = left_distance - left_wheel_distance_;
@@ -395,7 +430,7 @@ private:
         // Create and publish odometry message
         auto odom_msg = std::make_unique<nav_msgs::msg::Odometry>();
         odom_msg->header.stamp = current_time;
-        odom_msg->header.frame_id = "odom";
+        odom_msg->header.frame_id = "odom_real";
         odom_msg->child_frame_id = "base_link";
 
         // Position
@@ -433,16 +468,16 @@ private:
         right_msg->data = right_wheel_distance_;
         right_distance_publisher_->publish(std::move(right_msg));
 
-        // Publish wheel velocities
+        // Publish robot velocities (cmd_vel_real)
         auto vel_msg = std::make_unique<geometry_msgs::msg::Twist>();
-        vel_msg->linear.x = left_vel;   // Left wheel velocity
-        vel_msg->linear.y = right_vel;  // Right wheel velocity
+        vel_msg->linear.x = linear_velocity_;    // Robot linear velocity
+        vel_msg->angular.z = angular_velocity_;  // Robot angular velocity
         cmd_vel_publisher_->publish(std::move(vel_msg));
 
         // Publish TF transform
         geometry_msgs::msg::TransformStamped t;
         t.header.stamp = current_time;
-        t.header.frame_id = "odom";
+        t.header.frame_id = "odom_real";
         t.child_frame_id = "base_link";
 
         t.transform.translation.x = x_;
