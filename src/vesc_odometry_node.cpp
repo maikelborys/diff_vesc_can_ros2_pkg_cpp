@@ -280,6 +280,7 @@ private:
             
             // IMPORTANT: VESC reports electrical revolutions, divide by 6 for mechanical revolutions
             // This is because VESC controllers use 6-pole motors (6 electrical revolutions = 1 mechanical revolution)
+            // Based on user measurements: 10 mechanical rotations in 12s should give ~0.93 m/s, not 2.3 m/s
             int32_t tachometer = tachometer_raw / 6;
 
             std::lock_guard<std::mutex> lock(data_mutex_);
@@ -409,6 +410,22 @@ private:
         // Calculate current wheel distances
         auto [left_distance, right_distance] = calculateWheelDistances();
 
+        // Skip velocity calculation if tachometers are not initialized
+        if (!left_tach_initial_.has_value() || !right_tach_initial_.has_value()) {
+            last_time_ = current_time;
+            return;
+        }
+
+        // Initialize wheel distances on first run
+        static bool first_run = true;
+        if (first_run) {
+            left_wheel_distance_ = left_distance;
+            right_wheel_distance_ = right_distance;
+            first_run = false;
+            last_time_ = current_time;
+            return;
+        }
+
         // Debug: Show wheel distances every 100 cycles
         static int distance_debug_count = 0;
         if (++distance_debug_count % 100 == 0) {
@@ -420,10 +437,24 @@ private:
         double delta_left = left_distance - left_wheel_distance_;
         double delta_right = right_distance - right_wheel_distance_;
 
+        // Debug: Show deltas every 50 cycles
+        static int delta_debug_count = 0;
+        if (++delta_debug_count % 50 == 0) {
+            RCLCPP_INFO(this->get_logger(), "Deltas: left=%.6f, right=%.6f (left_dist=%.3f->%.3f, right_dist=%.3f->%.3f)", 
+                       delta_left, delta_right, left_wheel_distance_, left_distance, right_wheel_distance_, right_distance);
+        }
+
         // Update odometry
         updateOdometry(delta_left, delta_right, dt);
 
-        // Update stored distances
+        // Debug: Show velocities every 100 cycles
+        static int velocity_debug_count = 0;
+        if (++velocity_debug_count % 100 == 0) {
+            RCLCPP_INFO(this->get_logger(), "Velocities: linear=%.3f m/s, angular=%.3f rad/s (delta_left=%.4f, delta_right=%.4f, dt=%.3f)", 
+                       linear_velocity_, angular_velocity_, delta_left, delta_right, dt);
+        }
+
+        // Update stored distances for next cycle
         left_wheel_distance_ = left_distance;
         right_wheel_distance_ = right_distance;
 
